@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-from typing import List, Tuple
+from typing import List, Tuple, Callable
 
 from ndpm.summaries import VaeSummaries
 from loss import bernoulli_nll, logistic_nll, gaussian_nll, laplace_nll
@@ -70,32 +70,38 @@ class Vae(ComponentG, ABC):
         x_mean = self.decode(z)
         return x_mean
 
-    def reconstruction_loss(self, x, x_mean, x_log_var=None):
+    def reconstruction_loss(self,
+                            x: Tensor,
+                            x_mean: Tensor,
+                            x_log_var: Tensor = None) -> Tensor:
         loss_type = self.config['recon_loss']
-        loss = (
-            bernoulli_nll if loss_type == 'bernoulli' else
-            gaussian_nll if loss_type == 'gaussian' else
-            laplace_nll if loss_type == 'laplace' else
-            logistic_nll if loss_type == 'logistic' else None
-        )
-        if loss is None:
-            raise ValueError('Unknown recon_loss type: {}'.format(loss_type))
-
         if len(x_mean.size()) > len(x.size()):
             x = x.unsqueeze(1)
 
-        return (
-            loss(x, x_mean) if x_log_var is None else
-            loss(x, x_mean, x_log_var)
-        )
+        if loss_type == "bernoulli":
+            return bernoulli_nll(x, x_mean)
+        assert x_log_var is not None
+        if loss_type == "gaussian":
+            return gaussian_nll(x, x_mean, x_log_var)
+        elif loss_type == "laplace":
+            return laplace_nll(x, x_mean, x_log_var)
+        elif loss_type == "logistic":
+            return logistic_nll(x, x_mean, x_log_var)
+        else:
+            raise ValueError('Unknown recon_loss type: {}'.format(loss_type))
+
+
 
     @staticmethod
-    def gaussian_kl(q_mean, q_log_var, p_mean=None, p_log_var=None):
+    def gaussian_kl(q_mean: Tensor,
+                    q_log_var: Tensor,
+                    p_mean: Tensor = None,
+                    p_log_var: Tensor = None) -> Tensor:
         # p defaults to N(0, 1)
         zeros = torch.zeros_like(q_mean)
-        p_mean = p_mean if p_mean is not None else zeros
-        p_log_var = p_log_var if p_log_var is not None else zeros
-        # calcaulate KL(q, p)
+        p_mean = zeros if p_mean is None else p_mean 
+        p_log_var = zeros if p_log_var is None else p_log_var
+        # calculate KL(q, p)
         kld = 0.5 * (
             p_log_var - q_log_var +
             (q_log_var.exp() + (q_mean - p_mean) ** 2) / p_log_var.exp() - 1
@@ -104,7 +110,7 @@ class Vae(ComponentG, ABC):
         return kld
 
     @staticmethod
-    def reparameterize(z_mean, z_log_var, num_samples=1):
+    def reparameterize(z_mean: Tensor, z_log_var: Tensor, num_samples = 1) -> Tensor:
         z_std = (z_log_var * 0.5).exp()
         z_std = z_std.unsqueeze(1).expand(-1, num_samples, -1)
         z_mean = z_mean.unsqueeze(1).expand(-1, num_samples, -1)
@@ -114,15 +120,15 @@ class Vae(ComponentG, ABC):
         return z
 
     @abstractmethod
-    def encode(self, x):
+    def encode(self, x: Tensor) -> Tuple[Tensor, Tensor]:
         pass
 
     @abstractmethod
-    def decode(self, x):
+    def decode(self, x: Tensor) -> Tensor:
         pass
 
     @property
-    def log_var(self):
+    def log_var(self) -> Optional[Tensor]:
         return (
             None if self.log_var_param is None else
             self.log_var_param
@@ -130,8 +136,7 @@ class Vae(ComponentG, ABC):
 
 
 class SharingVae(Vae, ABC):
-    def collect_nll(self, x, y=None, step=None) \
-            -> Tuple[Tensor, List[VaeSummaries]]:
+    def collect_nll(self, x: Tensor, y=None, step=None) -> Tuple[Tensor, List[VaeSummaries]]:
         """Collect NLL values
 
         Returns:
@@ -148,24 +153,28 @@ class SharingVae(Vae, ABC):
 
         # Decode
         loss_vaes, summaries = [dummy_nll], [dummy_summary]
+        # self.experts[0] is the 'dummy' G_0 model
+        # self.experts[1:] are the predecessors (other `SharingVae's.`)
+        # self: current expert.
         vaes = [expert.g for expert in self.experts[1:]] + [self]
         x_logits = []
         for z_mean, z_log_var, vae in zip(z_means, z_log_vars, vaes):
-            z = self.reparameterize(z_mean, z_log_var, self.config['z_samples'])
+            z_samples = self.config['z_samples']
+            z = self.reparameterize(z_mean, z_log_var, z_samples)
+
             if self.config.get('precursor_conditioned_decoder'):
                 x_logit = vae.decode(z, as_logit=True)
                 x_logits.append(x_logit)
                 continue
+            
             x_mean = vae.decode(z)
-            x_mean = x_mean.view(x.size(0), self.config['z_samples'],
-                                 *x.shape[1:])
+            x_mean = x_mean.view(x.size(0), z_samples, *x.shape[1:])
             x_log_var = (
                 None if self.config['recon_loss'] == 'bernoulli' else
                 self.log_var.view(1, 1, -1, 1, 1)
             )
             loss_recon = self.reconstruction_loss(x, x_mean, x_log_var)
-            loss_recon = loss_recon.view(x.size(0), self.config['z_samples'],
-                                         -1)
+            loss_recon = loss_recon.view(x.size(0), z_samples, -1)
             loss_recon = loss_recon.sum(2).mean(1)
             loss_kl = self.gaussian_kl(z_mean, z_log_var)
             loss_vae = loss_recon + loss_kl
@@ -186,15 +195,13 @@ class SharingVae(Vae, ABC):
         ))
         for x_logit in x_logits:
             x_mean = torch.sigmoid(x_logit)
-            x_mean = x_mean.view(x.size(0), self.config['z_samples'],
-                                 *x.shape[1:])
+            x_mean = x_mean.view(x.size(0), z_samples, *x.shape[1:])
             x_log_var = (
                 None if self.config['recon_loss'] == 'bernoulli' else
                 self.log_var.view(1, 1, -1, 1, 1)
             )
             loss_recon = self.reconstruction_loss(x, x_mean, x_log_var)
-            loss_recon = loss_recon.view(x.size(0), self.config['z_samples'],
-                                         -1)
+            loss_recon = loss_recon.view(x.size(0), z_samples, -1)
             loss_recon = loss_recon.sum(2).mean(1)
             loss_kl = self.gaussian_kl(z_mean, z_log_var)
             loss_vae = loss_recon + loss_kl
@@ -219,11 +226,11 @@ class SharingVae(Vae, ABC):
         return torch.stack(loss_vaes, dim=1), summaries
 
     @abstractmethod
-    def encode(self, x, collect=False):
+    def encode(self, x: Tensor, collect=False) -> Tuple[Tensor, Tensor]:
         pass
 
     @abstractmethod
-    def decode(self, z, as_logit=False):
+    def decode(self, z: Tensor, as_logit=False) -> Tensor:
         """
         Decode do not share parameters
         """

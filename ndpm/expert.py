@@ -5,38 +5,38 @@ from .summaries import (
 )
 from components.component import ComponentG, ComponentD
 from components import G, D
-from typing import Tuple
+from typing import Tuple, Optional
 
 
 class Expert(nn.Module):
-    def __init__(self, config, experts: Tuple = ()):
+    def __init__(self, config, experts: Tuple["Expert", ...] = ()):
         super().__init__()
         self.config = config
         self.id = len(experts)
         self.experts = experts
-        self.device = config['device'] if 'device' in config else 'cuda'
+        self.device = config.get("device", "cuda")
 
-        self.g: ComponentG = G[config['g']](config, experts)
-        self.d: ComponentD = (
-            D[config['d']](config, experts) if not config['disable_d'] else None
-        )
+        self.g: ComponentG = G[config["g"]](config, experts)
+        self.d: Optional[ComponentD] = None
+        if not config["disable_d"]:
+            self.d = D[config["d"]](config, experts)
 
-        # use random initialized g if it's a placeholder
+        # use random initialized g if it"s a placeholder
         if self.id == 0:
             self.eval()
             for p in self.g.parameters():
                 p.requires_grad = False
 
-        # use random initialized d if it's a placeholder
-        if self.id == 0 and self.d is not None:
-            for p in self.d.parameters():
-                p.requires_grad = False
+            # use random initialized d if it"s a placeholder
+            if self.d is not None:
+                for p in self.d.parameters():
+                    p.requires_grad = False
 
         # otherwise use pretrained weights if provided
-        if config.get('pretrained_init') is not None:
-            state_dict = torch.load(config['pretrained_init'])
+        if config.get("pretrained_init") is not None:
+            state_dict = torch.load(config["pretrained_init"])
             state_dict = {
-                k.split('component.')[1]: v for k, v in state_dict.items()
+                k.split("component.")[1]: v for k, v in state_dict.items()
             }
             self.g.load_state_dict(state_dict)
 
@@ -50,7 +50,7 @@ class Expert(nn.Module):
             d_nll, d_summaries = self.d.nll(x, y, step)
             nll = nll + d_nll
             summaries = summaries + d_summaries
-            summaries.add_tensor_summary('loss/total', nll.mean(), 'scalar')
+            summaries.add_tensor_summary("loss/total", nll.mean(), "scalar")
         return nll, summaries
 
     def collect_nll(self, x, y, step=None):
@@ -68,7 +68,7 @@ class Expert(nn.Module):
             for i, (g_s, d_s) in enumerate(zip(summaries, d_summaries)):
                 new_summary = g_s + d_s
                 new_summary.add_tensor_summary(
-                    'loss/total', nll[:, i].mean(), 'scalar')
+                    "loss/total", nll[:, i].mean(), "scalar")
                 new_summaries.append(new_summary)
             summaries = new_summaries
         return nll, summaries

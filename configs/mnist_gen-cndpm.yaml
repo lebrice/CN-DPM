@@ -22,7 +22,7 @@ x_h: 28
 x_w: 28
 y_c: 10
 
-device: 'cuda'
+device: 'cpu'
 
 model_name: 'ndpm_model'
 g: 'mlp_sharing_vae'

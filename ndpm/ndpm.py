@@ -4,16 +4,17 @@ import torch.nn as nn
 from torch.utils.data import TensorDataset, DataLoader, RandomSampler
 from .expert import Expert
 from .priors import CumulativePrior
-
+from torch import Tensor
+from typing import List
 
 class Ndpm(nn.Module):
     def __init__(self, config, writer: SummaryWriter):
         super().__init__()
         self.config = config
-        self.experts = nn.ModuleList([Expert(config)])
+        self.experts: List[Expert] = nn.ModuleList([Expert(config)]) #type: ignore
         self.stm_capacity = config['stm_capacity']
-        self.stm_x = []
-        self.stm_y = []
+        self.stm_x: List[Tensor] = []
+        self.stm_y: List[Tensor] = []
         self.stm_next_erase = config['stm_erase_period']
         self.prior = CumulativePrior(config)
         self.device = config['device'] if 'device' in config else 'cuda'
@@ -25,9 +26,12 @@ class Ndpm(nn.Module):
     def forward(self, x, return_assignments=False):
         if len(self.experts) == 1:
             raise RuntimeError('There\'s no expert to run on the input')
+        print("BLABLABOB")
+        exit()
         x = x.to(self.device)
-        log_evid = -self.experts[-1].g.collect_nll(x)[0]  # [B, 1+K]
-        log_evid = log_evid[:, 1:].unsqueeze(2)  # [B, K, 1]
+        last_expert: Expert = self.experts[-1]
+        log_evid = -last_expert.g.collect_nll(x)[0]  # [B, 1+K]
+        log_evid = log_evid[:, 1:, None]  # [B, K, 1]
         log_prior = -self.prior.nl_prior()[1:]  # [K]
         log_prior -= torch.logsumexp(log_prior, dim=0)
         log_prior = log_prior.unsqueeze(0).unsqueeze(2)  # [1, K, 1]
