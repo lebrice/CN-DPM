@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-from typing import List, Tuple, Callable
+from typing import List, Tuple, Callable, Optional
 
 from ndpm.summaries import VaeSummaries
 from loss import bernoulli_nll, logistic_nll, gaussian_nll, laplace_nll
@@ -74,10 +74,10 @@ class Vae(ComponentG, ABC):
                             x: Tensor,
                             x_mean: Tensor,
                             x_log_var: Tensor = None) -> Tensor:
-        loss_type = self.config['recon_loss']
         if len(x_mean.size()) > len(x.size()):
             x = x.unsqueeze(1)
 
+        loss_type = self.config['recon_loss']
         if loss_type == "bernoulli":
             return bernoulli_nll(x, x_mean)
         assert x_log_var is not None
@@ -129,10 +129,7 @@ class Vae(ComponentG, ABC):
 
     @property
     def log_var(self) -> Optional[Tensor]:
-        return (
-            None if self.log_var_param is None else
-            self.log_var_param
-        )
+        return self.log_var_param
 
 
 class SharingVae(Vae, ABC):

@@ -26,8 +26,6 @@ class Ndpm(nn.Module):
     def forward(self, x, return_assignments=False):
         if len(self.experts) == 1:
             raise RuntimeError('There\'s no expert to run on the input')
-        print("BLABLABOB")
-        exit()
         x = x.to(self.device)
         last_expert: Expert = self.experts[-1]
         log_evid = -last_expert.g.collect_nll(x)[0]  # [B, 1+K]
@@ -48,7 +46,6 @@ class Ndpm(nn.Module):
     def learn(self, x, y, step):
         summarize = step % self.config['summary_step'] == 0
         x, y = x.to(self.device), y.to(self.device)
-
         if self.config.get('send_to_stm_always'):
             self.stm_x.extend(torch.unbind(x.cpu()))
             self.stm_y.extend(torch.unbind(y.cpu()))
@@ -100,6 +97,7 @@ class Ndpm(nn.Module):
             self.stm_y.extend(torch.unbind(y[to_stm].cpu()))
             self.stm_next_erase -= 1
             if self.stm_next_erase == 0 and self.config['stm_erase_period'] > 0:
+                # TODO: Shouldn't this be a 'while'?
                 if len(self.stm_x) > 0:
                     self.stm_x.pop(0)
                     self.stm_y.pop(0)
@@ -110,8 +108,7 @@ class Ndpm(nn.Module):
                 min_joint = nl_joint.min(dim=1)[0].view(-1, 1)
                 to_expert = torch.exp(-nl_joint + min_joint)  # [B, 1+K]
                 to_expert[:, 0] = 0.  # [B, 1+K]
-                to_expert = \
-                    to_expert / (to_expert.sum(dim=1).view(-1, 1) + 1e-7)
+                to_expert /= (to_expert.sum(dim=1).view(-1, 1) + 1e-7)
 
             if 'known_destination' in self.config:
                 to_expert = torch.eye(len(self.experts))[destination]
@@ -127,54 +124,57 @@ class Ndpm(nn.Module):
 
             # Do lr_decay implicitly
             if self.config['implicit_lr_decay']:
-                losses = losses \
-                    * self.config['stm_capacity'] / (self.prior.counts + 1e-8)
+                losses *= self.stm_capacity / (self.prior.counts + 1e-8)
             loss = losses.sum()
 
             if loss.requires_grad:
-                if 'update_min_usage' in self.config:
-                    update_threshold = self.config['update_min_usage']
-                else:
-                    update_threshold = 0
-                for k, usage in enumerate(expert_usage):
+                # Only update the experts that have reached a minimum usage
+                # threshold.
+                update_threshold = self.config.get('update_min_usage', 0)
+                for expert, usage in zip(self.experts, expert_usage):
                     if usage > update_threshold:
-                        self.experts[k].zero_grad()
+                        expert.zero_grad()
+                
                 loss.backward()
-                for k, usage in enumerate(expert_usage):
+                for expert, usage in zip(self.experts, expert_usage):
                     if usage > update_threshold:
-                        self.experts[k].clip_grad()
-                        self.experts[k].optimizer_step()
-                        self.experts[k].lr_scheduler_step()
+                        expert.clip_grad()
+                        expert.optimizer_step()
+                        expert.lr_scheduler_step()
 
         # Sleep
         if len(self.stm_x) >= self.stm_capacity:
             dream_dataset = TensorDataset(
-                torch.stack(self.stm_x), torch.stack(self.stm_y))
+                torch.stack(self.stm_x),
+                torch.stack(self.stm_y)
+            )
             self.sleep(dream_dataset)
-            self.stm_x = []
-            self.stm_y = []
+            self.stm_x.clear()
+            self.stm_y.clear()
 
-    def sleep(self, dream_dataset):
+    def sleep(self, dream_dataset: TensorDataset):
         print('\nGoing to sleep...')
         # Add new expert and optimizer
         expert = Expert(self.config, self.get_experts())
         self.experts.append(expert)
         self.prior.add_expert()
 
-        stacked_stm_x = torch.stack(self.stm_x)
-        stacked_stm_y = torch.stack(self.stm_y)
-        indices = torch.randperm(stacked_stm_x.size(0))
-        train_size = stacked_stm_x.size(0) - self.config['sleep_val_size']
-        dream_dataset = TensorDataset(
-            stacked_stm_x[indices[:train_size]],
-            stacked_stm_y[indices[:train_size]])
-        dream_val_x = stacked_stm_x[indices[train_size:]]
-        dream_val_y = stacked_stm_y[indices[train_size:]]
+
+        indices = torch.randperm(len(dream_dataset))
+
+        train_size = len(dream_dataset) - self.config['sleep_val_size']
+
+        train_samples = dream_dataset[indices[:train_size]]
+        valid_samples = dream_dataset[indices[train_size:]]
+        dream_dataset_train = TensorDataset(*train_samples)
+        dream_dataset_valid = TensorDataset(*valid_samples)
+        dream_val_x = dream_dataset_valid[:][0]
 
         # Prepare data iterator
         self.prior.record_usage(len(dream_dataset), index=-1)
+        
         dream_iterator = iter(DataLoader(
-            dream_dataset,
+            dream_dataset_train,
             batch_size=self.config['sleep_batch_size'],
             num_workers=self.config['sleep_num_workers'],
             sampler=RandomSampler(
@@ -191,8 +191,7 @@ class Ndpm(nn.Module):
             step += 1
             x, y = x.to(self.device), y.to(self.device)
             g_loss, g_summary = expert.g.nll(x, y, step=step)
-            g_loss = (g_loss + self.config['weight_decay']
-                      * expert.g.weight_decay_loss())
+            g_loss += self.config['weight_decay'] * expert.g.weight_decay_loss()
             expert.g.zero_grad()
             g_loss.mean().backward()
             expert.g.clip_grad()
@@ -200,21 +199,20 @@ class Ndpm(nn.Module):
 
             if step % self.config['sleep_summary_step'] == 0:
                 g_summary.write(
-                    self.writer, step,
-                    prefix='sleep_g_', postfix='/{}'.format(expert.id))
-                print('\r   [Sleep-G %6d] loss: %5.1f' % (
-                    step, g_loss.mean()
-                ), end='')
+                    self.writer,
+                    step,
+                    prefix='sleep_g_',
+                    postfix=f"/{expert.id}"
+                )
+                print(f"\r\t[Sleep-G {step:6d}] loss: {g_loss.mean():5.1f}", end="")
 
                 if self.config['sleep_val_size'] != 0:
                     with torch.no_grad():
-                        val_loss_g, val_summary_g = expert.g.nll(
-                            dream_val_x)
-                    val_summary_g.add_tensor_summary(
-                        'loss/total', val_loss_g, 'histogram')
+                        val_loss_g, val_summary_g = expert.g.nll(dream_val_x)
+                    val_summary_g.add_tensor_summary('loss/total', val_loss_g, 'histogram')
                     val_summary_g.write(self.writer, step,
-                                        prefix='sleep_val_g_',
-                                        postfix='/{}'.format(expert.id))
+                                        prefix="sleep_val_g_",
+                                        postfix=f"/{expert.id}")
         print()
 
         dream_iterator = iter(DataLoader(
